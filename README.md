@@ -1,4 +1,5 @@
 # NESO Wind Forecast Revision Monitor
+<img width="858" height="332" alt="WIND ENERGY" src="https://github.com/user-attachments/assets/3bc3082c-808a-433f-a8f2-cf33eeabbbfc" />
 
 A cloud deployed renewable energy analytics dashboard for monitoring run to run revisions in NESO 14 day ahead wind power forecasts.
 
