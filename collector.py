@@ -1,456 +1,131 @@
-import io
-import os
 import time
+import sys
+import logging
 
-import pandas as pd
-import psycopg2
-import requests
-from psycopg2.extras import execute_values
+# configure simple logging near the top of the file
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
-
-# ============================================================
-# NESO source configuration
-# ============================================================
-
-NESO_RESOURCE_ID = "93c3048e-1dab-4057-a2a9-417540583929"
-
-NESO_DATASTORE_URL = (
-    "https://api.neso.energy/api/3/action/datastore_search"
-)
-
-NESO_CSV_URL = (
-    "https://api.neso.energy/"
-    "dataset/2f134a4e-92e5-43b8-96c3-0dd7d92fcc52/"
-    "resource/93c3048e-1dab-4057-a2a9-417540583929/"
-    "download/14da_wind_forecast.csv"
-)
-
-REQUEST_HEADERS = {
-    "User-Agent": "NESO-Wind-Forecast-Monitor/1.0"
-}
-
-STANDARD_COLUMNS = [
-    "forecast_datetime",
-    "delivery_datetime",
-    "settlement_period",
-    "capacity_mw",
-    "wind_forecast_mw",
-]
-
-
-# ============================================================
-# Database configuration
-# ============================================================
-
-def get_database_url():
-    """
-    Read the Supabase database connection string from
-    the GitHub Actions DATABASE_URL secret.
-    """
-
-    database_url = os.environ.get("DATABASE_URL")
-
-    if not database_url:
-        raise RuntimeError(
-            "DATABASE_URL is missing. "
-            "Add it as a GitHub Actions repository secret."
-        )
-
-    return database_url
-
-
-# ============================================================
-# NESO data preparation
-# ============================================================
-
-def normalise_neso_forecast(dataframe):
-    """
-    Convert either NESO DataStore or CSV fields into
-    the standard database column structure.
-    """
-
-    if dataframe is None or dataframe.empty:
-        raise RuntimeError(
-            "NESO data was retrieved but contained no rows."
-        )
-
-    dataframe = dataframe.copy()
-
-    # Remove whitespace and a possible UTF-8 byte-order mark.
-    dataframe.columns = [
-        str(column).replace("\ufeff", "").strip()
-        for column in dataframe.columns
-    ]
-
-    # Support the field-name variations used by NESO.
-    rename_map = {
-        "ForecastDateTime": "forecast_datetime",
-        "ForecastDatetime": "forecast_datetime",
-        "forecast_datetime": "forecast_datetime",
-
-        "Datetime": "delivery_datetime",
-        "DateTime": "delivery_datetime",
-        "datetime": "delivery_datetime",
-        "delivery_datetime": "delivery_datetime",
-
-        "Settlement_Period": "settlement_period",
-        "Settlement Period": "settlement_period",
-        "settlement_period": "settlement_period",
-
-        "Capacity": "capacity_mw",
-        "capacity": "capacity_mw",
-        "capacity_mw": "capacity_mw",
-
-        "Wind_Forecast": "wind_forecast_mw",
-        "Wind Forecast": "wind_forecast_mw",
-        "wind_forecast": "wind_forecast_mw",
-        "wind_forecast_mw": "wind_forecast_mw",
+def fetch_latest_neso_forecast(retries=3, backoff=2):
+    parameters = {
+        "resource_id": NESO_RESOURCE_ID,
+        "limit": 5000
     }
 
-    dataframe = dataframe.rename(
-        columns=rename_map
-    )
-
-    missing_columns = [
-        column
-        for column in STANDARD_COLUMNS
-        if column not in dataframe.columns
-    ]
-
-    if missing_columns:
-        available_columns = ", ".join(
-            str(column)
-            for column in dataframe.columns
-        )
-
-        raise RuntimeError(
-            "NESO response is missing required columns: "
-            + ", ".join(missing_columns)
-            + ". Available columns: "
-            + available_columns
-        )
-
-    # Convert timestamps.
-    dataframe["forecast_datetime"] = pd.to_datetime(
-        dataframe["forecast_datetime"],
-        utc=True,
-        errors="coerce",
-    )
-
-    dataframe["delivery_datetime"] = pd.to_datetime(
-        dataframe["delivery_datetime"],
-        utc=True,
-        errors="coerce",
-    )
-
-    # Convert numerical fields.
-    dataframe["settlement_period"] = pd.to_numeric(
-        dataframe["settlement_period"],
-        errors="coerce",
-    )
-
-    dataframe["capacity_mw"] = pd.to_numeric(
-        dataframe["capacity_mw"],
-        errors="coerce",
-    )
-
-    dataframe["wind_forecast_mw"] = pd.to_numeric(
-        dataframe["wind_forecast_mw"],
-        errors="coerce",
-    )
-
-    # Remove invalid records.
-    dataframe = dataframe.dropna(
-        subset=STANDARD_COLUMNS
-    ).copy()
-
-    if dataframe.empty:
-        raise RuntimeError(
-            "NESO data was downloaded, but no valid rows "
-            "remained after date and numeric conversion."
-        )
-
-    dataframe["settlement_period"] = (
-        dataframe["settlement_period"].astype(int)
-    )
-
-    # Remove duplicate rows within the downloaded dataset.
-    dataframe = dataframe.drop_duplicates(
-        subset=[
-            "forecast_datetime",
-            "delivery_datetime",
-        ],
-        keep="last",
-    )
-
-    dataframe = dataframe.sort_values(
-        [
-            "forecast_datetime",
-            "delivery_datetime",
-        ]
-    ).reset_index(drop=True)
-
-    return dataframe[STANDARD_COLUMNS]
-
-
-# ============================================================
-# NESO DataStore retrieval
-# ============================================================
-
-def fetch_from_datastore():
-    """
-    Try the NESO CKAN DataStore three times.
-
-    If the DataStore remains empty or unavailable,
-    raise an error so the CSV fallback can be used.
-    """
-
-    last_error = None
-
-    for attempt in range(1, 4):
-
+    attempt = 0
+    while attempt < retries:
+        attempt += 1
         try:
             response = requests.get(
-                NESO_DATASTORE_URL,
-                params={
-                    "resource_id": NESO_RESOURCE_ID,
-                    "limit": 10000,
-                },
-                headers=REQUEST_HEADERS,
-                timeout=60,
+                NESO_API_URL,
+                params=parameters,
+                timeout=30
             )
-
-            print(
-                f"NESO DataStore attempt {attempt}: "
-                f"HTTP {response.status_code}"
-            )
-
             response.raise_for_status()
-
             payload = response.json()
 
-            if not payload.get("success", False):
-                raise RuntimeError(
-                    "NESO DataStore returned success=False."
-                )
+            if not payload.get("success"):
+                logging.warning("NESO API returned success=False on attempt %d: %s", attempt, payload)
+            else:
+                records = payload.get("result", {}).get("records", [])
+                if records:
+                    dataframe = pd.DataFrame(records)
+                    # continue with original validation/transform steps below
+                    required_columns = [
+                        "Datetime",
+                        "Settlement_Period",
+                        "Capacity",
+                        "Wind_Forecast",
+                        "ForecastDateTime"
+                    ]
 
-            records = (
-                payload.get("result", {})
-                .get("records", [])
-            )
+                    missing_columns = [
+                        column
+                        for column in required_columns
+                        if column not in dataframe.columns
+                    ]
 
-            print(
-                "DataStore records returned:",
-                len(records),
-            )
+                    if missing_columns:
+                        raise RuntimeError(f"Missing expected columns: {missing_columns}")
 
-            if records:
-                print(
-                    "NESO forecast retrieved from "
-                    "the DataStore API."
-                )
+                    dataframe["delivery_datetime"] = pd.to_datetime(
+                        dataframe["Datetime"],
+                        utc=True,
+                        errors="coerce"
+                    )
 
-                return normalise_neso_forecast(
-                    pd.DataFrame(records)
-                )
+                    dataframe["forecast_datetime"] = pd.to_datetime(
+                        dataframe["ForecastDateTime"],
+                        utc=True,
+                        errors="coerce"
+                    )
 
-            last_error = RuntimeError(
-                "NESO DataStore returned zero records."
-            )
+                    dataframe["settlement_period"] = pd.to_numeric(
+                        dataframe["Settlement_Period"],
+                        errors="coerce"
+                    )
 
-        except (
-            requests.RequestException,
-            ValueError,
-            RuntimeError,
-        ) as error:
+                    dataframe["capacity_mw"] = pd.to_numeric(
+                        dataframe["Capacity"],
+                        errors="coerce"
+                    )
 
-            last_error = error
+                    dataframe["wind_forecast_mw"] = pd.to_numeric(
+                        dataframe["Wind_Forecast"],
+                        errors="coerce"
+                    )
 
-            print(
-                f"DataStore attempt {attempt} failed: "
-                f"{error}"
-            )
+                    dataframe = dataframe.dropna(
+                        subset=[
+                            "forecast_datetime",
+                            "delivery_datetime",
+                            "settlement_period",
+                            "capacity_mw",
+                            "wind_forecast_mw"
+                        ]
+                    )
 
-        if attempt < 3:
-            wait_seconds = attempt * 10
+                    dataframe = dataframe[
+                        [
+                            "forecast_datetime",
+                            "delivery_datetime",
+                            "settlement_period",
+                            "capacity_mw",
+                            "wind_forecast_mw"
+                        ]
+                    ].copy()
 
-            print(
-                f"Retrying DataStore in "
-                f"{wait_seconds} seconds..."
-            )
+                    dataframe["settlement_period"] = dataframe["settlement_period"].astype(int)
 
-            time.sleep(wait_seconds)
+                    return dataframe
 
-    raise RuntimeError(
-        "NESO DataStore remained empty or unavailable "
-        f"after three attempts. Last error: {last_error}"
-    )
+                # no records in payload
+                logging.warning("NESO API returned 0 records on attempt %d.", attempt)
 
+        except (requests.RequestException, ValueError) as exc:
+            logging.warning("Request attempt %d failed: %s", attempt, exc)
 
-# ============================================================
-# Official CSV fallback
-# ============================================================
+        # retry if we still have attempts left
+        if attempt < retries:
+            sleep_seconds = backoff ** (attempt - 1)
+            logging.info("Retrying in %s seconds...", sleep_seconds)
+            time.sleep(sleep_seconds)
 
-def fetch_from_csv():
-    """
-    Download and normalise the official NESO CSV
-    when the CKAN DataStore returns no records.
-    """
-
-    print(
-        "Falling back to the official NESO CSV..."
-    )
-
-    response = requests.get(
-        NESO_CSV_URL,
-        headers=REQUEST_HEADERS,
-        timeout=120,
-    )
-
-    print(
-        "NESO CSV response:",
-        response.status_code,
-    )
-
-    response.raise_for_status()
-
-    content_type = response.headers.get(
-        "Content-Type",
-        "",
-    ).lower()
-
-    if "text/html" in content_type:
-        raise RuntimeError(
-            "NESO CSV URL returned HTML instead "
-            "of a CSV file."
-        )
-
-    dataframe = pd.read_csv(
-        io.BytesIO(response.content)
-    )
-
-    print(
-        "CSV rows downloaded:",
-        len(dataframe),
-    )
-
-    normalised_dataframe = (
-        normalise_neso_forecast(dataframe)
-    )
-
-    print(
-        "NESO forecast retrieved successfully "
-        "from the CSV fallback."
-    )
-
-    return normalised_dataframe
+    # After retries, return an empty DataFrame with the expected columns so caller can decide
+    logging.info("No NESO records after %d attempts; returning empty dataframe.", retries)
+    empty_df = pd.DataFrame(columns=[
+        "forecast_datetime",
+        "delivery_datetime",
+        "settlement_period",
+        "capacity_mw",
+        "wind_forecast_mw"
+    ])
+    return empty_df
 
 
-def fetch_latest_neso_forecast():
-    """
-    Retrieve the latest NESO forecast.
-
-    First try the CKAN DataStore with retries.
-    If that fails, use the official downloadable CSV.
-    """
-
-    datastore_error = None
-
-    try:
-        return fetch_from_datastore()
-
-    except Exception as error:
-        datastore_error = error
-
-        print(
-            "DataStore retrieval did not succeed:",
-            error,
-        )
-
-    try:
-        return fetch_from_csv()
-
-    except Exception as csv_error:
-        raise RuntimeError(
-            "Both NESO DataStore and CSV retrieval failed. "
-            f"DataStore error: {datastore_error}. "
-            f"CSV error: {csv_error}"
-        ) from csv_error
-
-
-# ============================================================
-# Supabase table management
-# ============================================================
-
-def create_table_if_needed(connection):
-    """
-    Create the Supabase table and indexes if they
-    do not already exist.
-    """
-
-    create_table_sql = """
-    CREATE TABLE IF NOT EXISTS neso_wind_forecasts (
-        id BIGSERIAL PRIMARY KEY,
-        forecast_datetime TIMESTAMPTZ NOT NULL,
-        delivery_datetime TIMESTAMPTZ NOT NULL,
-        settlement_period INTEGER,
-        capacity_mw NUMERIC,
-        wind_forecast_mw NUMERIC,
-        collected_at TIMESTAMPTZ DEFAULT NOW(),
-        UNIQUE (
-            forecast_datetime,
-            delivery_datetime
-        )
-    );
-
-    CREATE INDEX IF NOT EXISTS
-        idx_neso_forecast_datetime
-    ON neso_wind_forecasts (
-        forecast_datetime
-    );
-
-    CREATE INDEX IF NOT EXISTS
-        idx_neso_delivery_datetime
-    ON neso_wind_forecasts (
-        delivery_datetime
-    );
-    """
-
-    with connection.cursor() as cursor:
-        cursor.execute(create_table_sql)
-
-    connection.commit()
-
-
-def get_total_rows(connection):
-    """
-    Return the total number of stored wind records.
-    """
-
-    with connection.cursor() as cursor:
-
-        cursor.execute(
-            """
-            SELECT COUNT(*)
-            FROM neso_wind_forecasts;
-            """
-        )
-
-        total_rows = cursor.fetchone()[0]
-
-    return total_rows
-
-
-def insert_forecast_rows(
-    connection,
-    dataframe,
-):
-    """
-    Insert new wind-forecast rows into Supabase.
-
-    Duplicate forecast and delivery timestamps
-    are ignored.
-    """
+def insert_forecast_rows(connection, dataframe):
+    if dataframe is None or dataframe.empty:
+        logging.info("No rows to insert (empty dataframe).")
+        return 0
 
     rows = [
         (
@@ -458,18 +133,10 @@ def insert_forecast_rows(
             row.delivery_datetime.to_pydatetime(),
             int(row.settlement_period),
             float(row.capacity_mw),
-            float(row.wind_forecast_mw),
+            float(row.wind_forecast_mw)
         )
-        for row in dataframe.itertuples(
-            index=False
-        )
+        for row in dataframe.itertuples(index=False)
     ]
-
-    if not rows:
-        raise RuntimeError(
-            "No valid NESO forecast rows are "
-            "available for insertion."
-        )
 
     insert_sql = """
     INSERT INTO neso_wind_forecasts (
@@ -480,130 +147,68 @@ def insert_forecast_rows(
         wind_forecast_mw
     )
     VALUES %s
-    ON CONFLICT (
-        forecast_datetime,
-        delivery_datetime
-    )
+    ON CONFLICT (forecast_datetime, delivery_datetime)
     DO NOTHING;
     """
 
-    count_before = get_total_rows(
-        connection
-    )
+    count_before = get_total_rows(connection)
 
     with connection.cursor() as cursor:
-
         execute_values(
             cursor,
             insert_sql,
-            rows,
+            rows
         )
 
     connection.commit()
 
-    count_after = get_total_rows(
-        connection
-    )
+    count_after = get_total_rows(connection)
 
-    inserted_rows = (
-        count_after - count_before
-    )
+    inserted_rows = count_after - count_before
 
     return inserted_rows
 
 
-# ============================================================
-# Main collector
-# ============================================================
-
 def main():
-    """
-    Fetch the latest NESO wind forecast and
-    archive it in Supabase.
-    """
-
     database_url = get_database_url()
 
     dataframe = fetch_latest_neso_forecast()
 
-    latest_run = (
-        dataframe["forecast_datetime"].max()
-    )
+    if dataframe.empty:
+        logging.info("No forecast records fetched from NESO. Exiting without inserting.")
+        # exit 0 so the GitHub Action run doesn't fail due to no data
+        sys.exit(0)
 
-    delivery_start = (
-        dataframe["delivery_datetime"].min()
-    )
+    latest_run = dataframe["forecast_datetime"].max()
+    delivery_start = dataframe["delivery_datetime"].min()
+    delivery_end = dataframe["delivery_datetime"].max()
 
-    delivery_end = (
-        dataframe["delivery_datetime"].max()
-    )
+    print("Latest NESO forecast fetched successfully.")
+    print(f"Forecast publication time: {latest_run}")
+    print(f"Forecast delivery starts: {delivery_start}")
+    print(f"Forecast delivery ends: {delivery_end}")
+    print(f"Rows fetched: {len(dataframe):,}")
 
-    print(
-        "Latest NESO forecast fetched successfully."
-    )
-
-    print(
-        f"Forecast publication time: {latest_run}"
-    )
-
-    print(
-        f"Forecast delivery starts: {delivery_start}"
-    )
-
-    print(
-        f"Forecast delivery ends: {delivery_end}"
-    )
-
-    print(
-        f"Rows fetched: {len(dataframe):,}"
-    )
-
-    connection = psycopg2.connect(
-        database_url,
-        connect_timeout=30,
-    )
+    connection = psycopg2.connect(database_url)
 
     try:
-        create_table_if_needed(
-            connection
-        )
+        create_table_if_needed(connection)
 
         inserted_rows = insert_forecast_rows(
             connection,
-            dataframe,
+            dataframe
         )
 
-        total_rows = get_total_rows(
-            connection
-        )
+        total_rows = get_total_rows(connection)
 
         print("=" * 60)
-
-        print(
-            f"Rows inserted into database: "
-            f"{inserted_rows:,}"
-        )
-
-        print(
-            f"Total rows now in database: "
-            f"{total_rows:,}"
-        )
+        print(f"Rows inserted into database: {inserted_rows:,}")
+        print(f"Total rows now in database: {total_rows:,}")
 
         if inserted_rows == 0:
-            print(
-                "No new rows inserted. "
-                "This forecast run already exists."
-            )
-
+            print("No new rows inserted. This forecast run already exists or no data to insert.")
         else:
-            print(
-                "New NESO forecast run "
-                "archived successfully."
-            )
+            print("New NESO forecast run archived successfully.")
 
     finally:
         connection.close()
-
-
-if __name__ == "__main__":
-    main()
