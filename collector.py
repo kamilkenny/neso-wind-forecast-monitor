@@ -38,6 +38,10 @@ STANDARD_COLUMNS = [
 ]
 
 
+class NoForecastDataError(RuntimeError):
+    """Raised when an official NESO source returns no forecast rows."""
+
+
 # ============================================================
 # Database configuration
 # ============================================================
@@ -70,7 +74,7 @@ def normalise_neso_forecast(dataframe):
     """
 
     if dataframe is None or dataframe.empty:
-        raise RuntimeError(
+        raise NoForecastDataError(
             "NESO data was retrieved but contained no rows."
         )
 
@@ -208,7 +212,6 @@ def fetch_from_datastore():
     last_error = None
 
     for attempt in range(1, 4):
-
         try:
             response = requests.get(
                 NESO_DATASTORE_URL,
@@ -254,7 +257,7 @@ def fetch_from_datastore():
                     pd.DataFrame(records)
                 )
 
-            last_error = RuntimeError(
+            last_error = NoForecastDataError(
                 "NESO DataStore returned zero records."
             )
 
@@ -263,7 +266,6 @@ def fetch_from_datastore():
             ValueError,
             RuntimeError,
         ) as error:
-
             last_error = error
 
             print(
@@ -281,10 +283,16 @@ def fetch_from_datastore():
 
             time.sleep(wait_seconds)
 
+    if isinstance(last_error, NoForecastDataError):
+        raise NoForecastDataError(
+            "NESO DataStore returned no forecast rows "
+            "after three attempts."
+        ) from last_error
+
     raise RuntimeError(
-        "NESO DataStore remained empty or unavailable "
-        f"after three attempts. Last error: {last_error}"
-    )
+        "NESO DataStore remained unavailable after "
+        f"three attempts. Last error: {last_error}"
+    ) from last_error
 
 
 # ============================================================
@@ -325,14 +333,30 @@ def fetch_from_csv():
             "of a CSV file."
         )
 
-    dataframe = pd.read_csv(
-        io.BytesIO(response.content)
+    print(
+        "CSV bytes downloaded:",
+        len(response.content),
     )
+
+    try:
+        dataframe = pd.read_csv(
+            io.BytesIO(response.content)
+        )
+
+    except pd.errors.EmptyDataError as error:
+        raise NoForecastDataError(
+            "NESO CSV response contained no CSV data."
+        ) from error
 
     print(
         "CSV rows downloaded:",
         len(dataframe),
     )
+
+    if dataframe.empty:
+        raise NoForecastDataError(
+            "NESO CSV returned zero forecast rows."
+        )
 
     normalised_dataframe = (
         normalise_neso_forecast(dataframe)
@@ -352,6 +376,11 @@ def fetch_latest_neso_forecast():
 
     First try the CKAN DataStore with retries.
     If that fails, use the official downloadable CSV.
+
+    Return None only when the official sources are reachable
+    but temporarily contain no forecast records. Other errors
+    still fail the workflow so genuine code or schema problems
+    are not silently hidden.
     """
 
     datastore_error = None
@@ -369,6 +398,26 @@ def fetch_latest_neso_forecast():
 
     try:
         return fetch_from_csv()
+
+    except NoForecastDataError as csv_error:
+        print(
+            "::warning title=NESO forecast unavailable::"
+            "Both the NESO DataStore and official CSV "
+            "returned no forecast records. The existing "
+            "Supabase archive was left unchanged."
+        )
+
+        print(
+            "DataStore error:",
+            datastore_error,
+        )
+
+        print(
+            "CSV error:",
+            csv_error,
+        )
+
+        return None
 
     except Exception as csv_error:
         raise RuntimeError(
@@ -428,7 +477,6 @@ def get_total_rows(connection):
     """
 
     with connection.cursor() as cursor:
-
         cursor.execute(
             """
             SELECT COUNT(*)
@@ -492,7 +540,6 @@ def insert_forecast_rows(
     )
 
     with connection.cursor() as cursor:
-
         execute_values(
             cursor,
             insert_sql,
@@ -522,9 +569,31 @@ def main():
     archive it in Supabase.
     """
 
-    database_url = get_database_url()
+    print("Collector version: resilient-v3")
 
     dataframe = fetch_latest_neso_forecast()
+
+    if dataframe is None or dataframe.empty:
+        print("=" * 60)
+
+        print(
+            "No NESO forecast snapshot was available "
+            "during this collection attempt."
+        )
+
+        print(
+            "No database changes were made. The existing "
+            "Supabase records remain intact."
+        )
+
+        print(
+            "The next scheduled workflow will try again."
+        )
+
+        return
+
+    # Only require and open the database after valid NESO data exists.
+    database_url = get_database_url()
 
     latest_run = (
         dataframe["forecast_datetime"].max()
