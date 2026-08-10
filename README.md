@@ -1,4 +1,5 @@
-<img width="2187" height="2131" alt="vfff" src="https://github.com/user-attachments/assets/c36b0997-0c54-47cb-9db9-087464db2bf0" />
+<img width="1536" height="855" alt="dispatch monitoring" src="https://github.com/user-attachments/assets/933d0189-b71a-4b61-aa0c-de3ebdd3cd3f" />
+
 
 
 
@@ -67,6 +68,7 @@ For example, if the latest forecast shows a large downward revision compared wit
 ---
 
 ## Data Source
+<img width="1536" height="1024" alt="wind forecast app" src="https://github.com/user-attachments/assets/a0f4f3bb-4883-40d4-8350-b8f3707177c8" />
 
 The data used in this project comes from the National Energy System Operator, NESO open data portal.
 
