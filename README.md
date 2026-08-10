@@ -6,7 +6,7 @@
 
 A cloud deployed renewable energy analytics dashboard for monitoring run to run revisions in NESO 14 day ahead wind power forecasts.
 
-Live dashboard:  
+# Deployed Real-time Dashboard:  
 https://neso-wind-forecast-monitor-knbc32cgs89awbzxdfujqi.streamlit.app/
 
 ---
